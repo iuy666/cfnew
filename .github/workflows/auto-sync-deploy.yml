@@ -1,0 +1,102 @@
+name: Auto Sync and Deploy to Cloudflare Pages
+
+on:
+  schedule:
+    # 每12小时检查一次 (UTC 时间 0:00 和 12:00)
+    - cron: '0 */12 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 步骤1: 检出代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # 步骤2: 配置 Git
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      # 步骤3: 添加上游仓库并同步
+      - name: Sync with upstream
+        run: |
+          git remote add upstream https://github.com/byJoey/cfnew.git || true
+          git fetch upstream
+          git checkout main
+          git merge upstream/main --no-edit --allow-unrelated-histories || echo "Already up to date or merge conflict"
+          git push origin main || echo "Nothing to push"
+
+      # 步骤4: 检查是否有新的 Release
+      - name: Check latest release
+        id: check_release
+        run: |
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/byJoey/cfnew/releases/latest | jq -r '.tag_name')
+          echo "Latest release: $LATEST_RELEASE"
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          
+          # 检查本地版本文件
+          if [ -f ".current_version" ]; then
+            CURRENT_VERSION=$(cat .current_version)
+          else
+            CURRENT_VERSION="none"
+          fi
+          
+          echo "Current version: $CURRENT_VERSION"
+          
+          if [ "$LATEST_RELEASE" != "$CURRENT_VERSION" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 步骤5: 下载并解压最新 Pages.zip
+      - name: Download latest Pages.zip
+        if: steps.check_release.outputs.needs_update == 'true'
+        run: |
+          # 下载最新的 Pages.zip
+          curl -L -o Pages.zip "https://github.com/byJoey/cfnew/releases/latest/download/Pages.zip"
+          
+          # 创建部署目录
+          rm -rf deploy_pages
+          mkdir -p deploy_pages
+          
+          # 解压
+          unzip -o Pages.zip -d deploy_pages
+          
+          # 显示解压内容
+          echo "解压内容:"
+          ls -la deploy_pages/
+
+      # 步骤6: 部署到 Cloudflare Pages
+      - name: Deploy to Cloudflare Pages
+        if: steps.check_release.outputs.needs_update == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy deploy_pages --project-name=byjoeypages
+
+      # 步骤7: 更新版本记录
+      - name: Update version file
+        if: steps.check_release.outputs.needs_update == 'true'
+        run: |
+          echo "${{ steps.check_release.outputs.release_tag }}" > .current_version
+          git add .current_version
+          git commit -m "Update to ${{ steps.check_release.outputs.release_tag }}" || echo "No changes to commit"
+          git push || echo "Nothing to push"
+
+      # 步骤8: 输出结果
+      - name: Summary
+        run: |
+          if [ "${{ steps.check_release.outputs.needs_update }}" == "true" ]; then
+            echo "✅ 已更新并部署版本: ${{ steps.check_release.outputs.release_tag }}"
+          else
+            echo "ℹ️ 已是最新版本，无需更新"
+          fi
