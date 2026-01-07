@@ -1,0 +1,84 @@
+name: Sync and Deploy to Cloudflare Pages
+
+on:
+  schedule:
+    # 每12小时检查一次上游更新
+    - cron: '0 */12 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  check-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest release info from byJoey/cfnew
+        id: get_release
+        run: |
+          RELEASE_INFO=$(curl -s https://api.github.com/repos/byJoey/cfnew/releases/latest)
+          LATEST_TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
+          DOWNLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.assets[] | select(.name == "Pages.zip") | .browser_download_url')
+          
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+          echo "Latest version: $LATEST_TAG"
+
+      - name: Check if update needed
+        id: check_update
+        run: |
+          LATEST_TAG="${{ steps.get_release.outputs.latest_tag }}"
+          CURRENT_TAG=""
+          
+          if [ -f "VERSION" ]; then
+            CURRENT_TAG=$(cat VERSION)
+          fi
+          
+          echo "Current: $CURRENT_TAG, Latest: $LATEST_TAG"
+          
+          if [ "$CURRENT_TAG" != "$LATEST_TAG" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download and extract Pages.zip
+        if: steps.check_update.outputs.needs_update == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          curl -L -o Pages.zip "${{ steps.get_release.outputs.download_url }}"
+          
+          # 创建部署目录
+          mkdir -p deploy
+          unzip -o Pages.zip -d deploy
+          
+          echo "${{ steps.get_release.outputs.latest_tag }}" > deploy/VERSION
+
+      - name: Update UUID in _worker.js
+        if: steps.check_update.outputs.needs_update == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          if [ -f "deploy/_worker.js" ]; then
+            sed -i "s/let uuid[[:space:]]*=[[:space:]]*'[^']*'/let uuid = 'a9ce9d95-8d40-4e22-b3f6-074130e161c8'/" deploy/_worker.js
+            sed -i "s/const uuid[[:space:]]*=[[:space:]]*'[^']*'/const uuid = 'a9ce9d95-8d40-4e22-b3f6-074130e161c8'/" deploy/_worker.js
+            sed -i 's/userID[[:space:]]*=[[:space:]]*"[0-9a-f\-]\{36\}"/userID = "a9ce9d95-8d40-4e22-b3f6-074130e161c8"/g' deploy/_worker.js
+          fi
+
+      - name: Deploy to Cloudflare Pages
+        if: steps.check_update.outputs.needs_update == 'true' || github.event_name == 'workflow_dispatch'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: pages deploy deploy --project-name=byjoeypages
+
+      - name: Update VERSION file in repo
+        if: steps.check_update.outputs.needs_update == 'true'
+        run: |
+          echo "${{ steps.get_release.outputs.latest_tag }}" > VERSION
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add VERSION
+          git commit -m "Update to ${{ steps.get_release.outputs.latest_tag }}" || echo "No changes"
+          git push
